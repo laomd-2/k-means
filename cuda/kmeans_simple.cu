@@ -30,31 +30,29 @@ __device__ int find_nearest_cluster(float x, float y, const float* means_x, cons
     return best_cluster;
 }
 
-__device__ void reduce_in_block(float* local_sum, int* local_count, 
-                                float* new_sums_x, float* new_sums_y, int* counts, int k)
+template <typename T>
+__device__ void reduce_in_block(T* local, T* global, int k)
 {
     // reduction
     extern __shared__ float shared_data[];
+    if (threadIdx.x < k) shared_data[threadIdx.x] = 0.0f;
+    __syncthreads();
+
     for (int i = 0; i < k; i++) {
         for (int stride = WARP_SIZE/2; stride>0; stride>>=1) {
-            local_sum[2 * i] += __shfl_down(local_sum[2 * i], stride);
-            local_sum[2 * i + 1] += __shfl_down(local_sum[2 * i + 1], stride);
-            local_count[i] += __shfl_down(local_count[i], stride);
+            local[i] += __shfl_down(local[i], stride);
         }
         // warp之间隐式同步，无需原子操作
         if ((threadIdx.x & (WARP_SIZE - 1)) == 0) {
-            shared_data[3 * i] += local_sum[2 * i];
-            shared_data[3 * i + 1] += local_sum[2 * i + 1];
-            shared_data[3 * i + 2] += local_count[i];
+            shared_data[i] += local[i];
         }
+        __syncthreads();
     }
-    if (threadIdx.x == 0) {
-        for (int i = 0; i < k; i++) {
-            int offset = i * gridDim.x;
-            new_sums_x[offset + blockIdx.x] = shared_data[3 * i];
-            new_sums_y[offset+ blockIdx.x] = shared_data[3 * i + 1];
-            counts[offset + blockIdx.x] = int(shared_data[3 * i + 2] + 0.5f);
-        }
+    if (threadIdx.x < k) {
+        int offset = threadIdx.x * gridDim.x;
+        // k * num_blocks
+        // 这里虽然不能合并访存，但在compute_new_means归并时可以合并访存
+        global[offset + blockIdx.x] = shared_data[threadIdx.x];
     }
 }
 
@@ -65,7 +63,8 @@ __global__ void assign_clusters(const float* data_x, const float* data_y, int* l
     const int id = blockIdx.x * blockDim.x + threadIdx.x;
     const int width = blockDim.x * gridDim.x;
 
-    float local_sum[32] = {0.0f};
+    float local_sum_x[16] = {0.0f};
+    float local_sum_y[16] = {0.0f};
     int local_count[16] = {0};
 
     for (int i = 0; i < p; i++) {
@@ -76,12 +75,14 @@ __global__ void assign_clusters(const float* data_x, const float* data_y, int* l
         const float y = data_y[index];
         int best_cluster = find_nearest_cluster(x, y, means_x, means_y, k);
         label[index] = best_cluster;
-        local_sum[2 * best_cluster] = x;
-        local_sum[2 * best_cluster + 1] = y;
+        local_sum_x[best_cluster] += x;
+        local_sum_y[best_cluster] += y;
         local_count[best_cluster]++;
     }
 
-    reduce_in_block(local_sum, local_count, new_sums_x, new_sums_y, counts, k);
+    reduce_in_block(local_sum_x, new_sums_x, k);
+    reduce_in_block(local_sum_y, new_sums_y, k);
+    reduce_in_block(local_count, counts, k);
 }
 
 // Each thread is one cluster, which just recomputes its coordinates as the mean
@@ -117,37 +118,23 @@ __global__ void compute_new_means(float* new_means_x, float* new_means_y,
     if (cluster == 0)   *max_diff = diff;
 }
 
-void init_clusters(const thrust::host_vector<float>& h_x, const thrust::host_vector<float>& h_y,
-                   thrust::device_vector<float>& d_mean_x,  thrust::device_vector<float>& d_mean_y, int k) {
-    int n = h_x.size();
-    int index = rand() % n;
-    d_mean_x[0] = h_x[index];
-    d_mean_y[0] = h_y[index];
-    
-    thrust::host_vector<float> distance(n);
-    std::default_random_engine e;
-    std::uniform_real_distribution<double> u(0.0, 1.0);
-    for (int i = 1; i < k; i++) {   // 待选中心
-        float sum = 0.0f;
-        for (int k = 0; k < n; k++) {
-            float dd = FLT_MAX;
-            for (int j = 0; j < i; j++) {   // 已选的中心
-                float d = squared_l2_distance(h_x[k], h_y[k], d_mean_x[j], d_mean_y[j]);
-                if (d < dd)     dd = d;
-            }
-            sum += dd;
-            distance[k] = dd;
-        }
-        int num = u(e) * sum;
-        int index = 0;
-        while (sum > 0) {
-            sum -= distance[index];
-            index++;
-        }
-        d_mean_x[i] = h_x[index];
-        d_mean_y[i] = h_y[index];
-    }
-}
+// void init_clusters(const float* data_x, const float* data_y, float* distance, int number_of_elements,
+//                    float* d_mean_x, float* d_mean_y, int num_choices) {
+//     const int id = blockIdx.x * blockDim.x + threadIdx.x;
+//     const int width = blockDim.x * gridDim.x;
+//     for (int i = 0; i < p; i++) {
+//         int index = i * width + id;
+//         if (index >= data_size) return;
+
+//         float dd = FLT_MAX;
+//         for (int j = 0; j < i; j++) {   // 已选的中心
+//             float d = squared_l2_distance(h_x[k], h_y[k], d_mean_x[j], d_mean_y[j]);
+//             if (d < dd)     dd = d;
+//         }
+//         distance[index] = dd;
+//     }
+// }
+
 int main(int argc, const char *argv[])
 {
     std::ifstream fx(argv[1]), fy(argv[2]);
@@ -179,7 +166,12 @@ int main(int argc, const char *argv[])
     srand(time(NULL));
     thrust::device_vector<float> d_mean_x(k);
     thrust::device_vector<float> d_mean_y(k);
-    init_clusters(h_x, h_y, d_mean_x, d_mean_y, k);
+    for (int i = 0; i < k; i++) {
+        int index = rand() % number_of_elements;
+        d_mean_x[i] = h_x[index];
+        d_mean_y[i] = h_y[index];
+    }
+    // init_clusters(h_x, h_y, d_mean_x, d_mean_y, k);
 
     const int threads = 1024;
     int blocks = (number_of_elements + threads - 1) / threads, p = 1;
@@ -199,7 +191,7 @@ int main(int argc, const char *argv[])
     size_t iteration;
     for (iteration = 0; s > tol && iteration < number_of_iterations; ++iteration)
     {
-        assign_clusters<<<blocks, threads, 3 * k * sizeof(float)>>>(
+        assign_clusters<<<blocks, threads, k * sizeof(float)>>>(
             thrust::raw_pointer_cast(d_x.data()),
             thrust::raw_pointer_cast(d_y.data()),
             thrust::raw_pointer_cast(d_label.data()),
