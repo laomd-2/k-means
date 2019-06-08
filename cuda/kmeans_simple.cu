@@ -7,55 +7,80 @@
 #include <iostream>
 #include <fstream>
 
+#define WARP_SIZE 32
+
 __device__ float squared_l2_distance(float x_1, float y_1, float x_2, float y_2) {
   return (x_1 - x_2) * (x_1 - x_2) + (y_1 - y_2) * (y_1 - y_2);
 }
 
-// In the assignment step, each point (thread) computes its distance to each
-// cluster centroid and adds its x and y values to the sum of its closest
-// centroid, as well as incrementing that centroid's count of assigned points.
-__constant__ float means_x[32], means_y[32];
+__device__ int find_nearest_cluster(float x, float y, const float* means_x, const float* means_y, int k) {
+    float best_distance = FLT_MAX;
+    int best_cluster = 0;
+    for (int cluster = 0; cluster < k; ++cluster)
+    {
+        const float distance =
+            squared_l2_distance(x, y, means_x[cluster], means_y[cluster]);
+        if (distance < best_distance)
+        {
+            best_distance = distance;
+            best_cluster = cluster;
+        }
+    }
+    return best_cluster;
+}
 
-__global__ void assign_clusters(const float* data_x,
-                     const float* data_y,
-                     int data_size,
-                     const float* means_x,
-                     const float* means_y,
-                     int* label,
-                     float* new_sums_x,
-                     float* new_sums_y,
-                     int k, int p,
-                     int* counts)
+__device__ void reduce_in_block(float* local_sum, int* local_count, 
+                                float* new_sums_x, float* new_sums_y, int* counts, int k)
+{
+    // reduction
+    extern __shared__ float shared_data[];
+    for (int i = 0; i < k; i++) {
+        for (int stride = WARP_SIZE/2; stride>0; stride>>=1) {
+            local_sum[2 * i] += __shfl_down(local_sum[2 * i], stride);
+            local_sum[2 * i + 1] += __shfl_down(local_sum[2 * i + 1], stride);
+            local_count[i] += __shfl_down(local_count[i], stride);
+        }
+        // warp之间隐式同步，无需原子操作
+        if ((threadIdx.x & (WARP_SIZE - 1)) == 0) {
+            shared_data[3 * i] += local_sum[2 * i];
+            shared_data[3 * i + 1] += local_sum[2 * i + 1];
+            shared_data[3 * i + 2] += local_count[i];
+        }
+    }
+    if (threadIdx.x == 0) {
+        for (int i = 0; i < k; i++) {
+            int offset = i * gridDim.x;
+            new_sums_x[offset + blockIdx.x] = shared_data[3 * i];
+            new_sums_y[offset+ blockIdx.x] = shared_data[3 * i + 1];
+            counts[offset + blockIdx.x] = shared_data[3 * i + 2] + 0.5f;
+        }
+    }
+}
+
+__global__ void assign_clusters(const float* data_x, const float* data_y, int* label, int data_size,
+                                const float* means_x, const float* means_y, 
+                                float* new_sums_x, float* new_sums_y, int* counts, int k, int p)
 {
     const int id = blockIdx.x * blockDim.x + threadIdx.x;
     const int width = blockDim.x * gridDim.x;
+
+    float local_sum[32] = {0.0f};
+    int local_count[16] = {0};
+
     for (int i = 0; i < p; i++) {
         int index = i * width + id;
-        if (index >= data_size)
-            return;
+        if (index >= data_size) return;
 
-        // Make global loads once.
         const float x = data_x[index];
         const float y = data_y[index];
-
-        float best_distance = FLT_MAX;
-        int best_cluster = 0;
-        for (int cluster = 0; cluster < k; ++cluster)
-        {
-            const float distance =
-                squared_l2_distance(x, y, means_x[cluster], means_y[cluster]);
-            if (distance < best_distance)
-            {
-                best_distance = distance;
-                best_cluster = cluster;
-            }
-        }
-
+        int best_cluster = find_nearest_cluster(x, y, means_x, means_y, k);
         label[index] = best_cluster;
-        atomicAdd(new_sums_x + best_cluster, x);
-        atomicAdd(new_sums_y + best_cluster, y);
-        atomicAdd(counts + best_cluster, 1);
+        local_sum[2 * best_cluster] = x;
+        local_sum[2 * best_cluster + 1] = y;
+        local_count[best_cluster]++;
     }
+
+    reduce_in_block(local_sum, local_count, new_sums_x, new_sums_y, counts, k);
 }
 
 // Each thread is one cluster, which just recomputes its coordinates as the mean
@@ -64,15 +89,23 @@ __global__ void compute_new_means(float* new_means_x,
                        float* new_means_y,
                        float* new_sum_x,
                        float* new_sum_y,
-                       int* counts)
+                       int* counts, int blocks)
 {
     const int cluster = threadIdx.x;
-    const int count = max(1, counts[cluster]);
-    counts[cluster] = 0;
-    new_means_x[cluster] = new_sum_x[cluster] / count;
-    new_means_y[cluster] = new_sum_y[cluster] / count;
-    new_sum_x[cluster] = 0.0f;
-    new_sum_y[cluster] = 0.0f;
+    float sum_x = 0.0f, sum_y = 0.0f;
+    int count = 0, offset = cluster * blocks;
+    for (int i = 0; i < blocks; i++) {
+        sum_x += new_sum_x[offset + i];
+        new_sum_x[offset + i] = 0.0f;
+        sum_y += new_sum_y[offset + i];
+        new_sum_y[offset + i] = 0.0f;
+        count += counts[offset + i];
+        counts[offset + i] = 0;
+    }
+    if (count == 0) count = 1;
+    new_means_x[cluster] = sum_x / count;
+    new_means_y[cluster] = sum_y / count;
+    // printf("%d(%f %f) ", cluster, new_means_x[cluster], new_means_y[cluster]);
 }
 
 int main(int argc, const char *argv[])
@@ -112,32 +145,32 @@ int main(int argc, const char *argv[])
         d_mean_y[i] = h_y[i];
     }
 
-    thrust::device_vector<float> d_sums_x(k);
-    thrust::device_vector<float> d_sums_y(k);
-    thrust::device_vector<int> d_counts(k, 0), d_label(number_of_elements, 0);
-
     const int threads = 1024;
     int blocks = (number_of_elements + threads - 1) / threads, p = 1;
-    if (blocks > 32)
+    if (blocks > 64)
     {
-        blocks = 32;
-        p = (number_of_elements + 32767) / 32768;
+        blocks = 64;
+        p = (number_of_elements + 65535) / 65536;
     }
 
-    int number_of_iterations = 1000;
+    thrust::device_vector<float> d_sums_x(k * blocks);
+    thrust::device_vector<float> d_sums_y(k * blocks);
+    thrust::device_vector<int> d_counts(k * blocks, 0), d_label(number_of_elements, 0);
+
+    int number_of_iterations = 300;
     for (size_t iteration = 0; iteration < number_of_iterations; ++iteration)
     {
-        assign_clusters<<<blocks, threads>>>(
+        assign_clusters<<<blocks, threads, 3 * k * sizeof(float)>>>(
             thrust::raw_pointer_cast(d_x.data()),
             thrust::raw_pointer_cast(d_y.data()),
+            thrust::raw_pointer_cast(d_label.data()),
             number_of_elements,
             thrust::raw_pointer_cast(d_mean_x.data()),
             thrust::raw_pointer_cast(d_mean_y.data()),
-            thrust::raw_pointer_cast(d_label.data()),
             thrust::raw_pointer_cast(d_sums_x.data()),
             thrust::raw_pointer_cast(d_sums_y.data()),
-            k, p,
-            thrust::raw_pointer_cast(d_counts.data())
+            thrust::raw_pointer_cast(d_counts.data()),
+            k, p
         );
         cudaDeviceSynchronize();
 
@@ -146,7 +179,8 @@ int main(int argc, const char *argv[])
             thrust::raw_pointer_cast(d_mean_y.data()),
             thrust::raw_pointer_cast(d_sums_x.data()),
             thrust::raw_pointer_cast(d_sums_y.data()),
-            thrust::raw_pointer_cast(d_counts.data())
+            thrust::raw_pointer_cast(d_counts.data()),
+            blocks
         );
         cudaDeviceSynchronize();
     }
