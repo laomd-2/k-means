@@ -7,8 +7,10 @@
 #include <ctime>
 #include <iostream>
 #include <fstream>
+#include "utils.cuh"
 
 #define WARP_SIZE 32
+
 
 __device__ __host__ float squared_l2_distance(float x_1, float y_1, float x_2, float y_2) {
   return (x_1 - x_2) * (x_1 - x_2) + (y_1 - y_2) * (y_1 - y_2);
@@ -54,6 +56,18 @@ __device__ void reduce_in_block(T* local, T* global, int k)
         // 这里虽然不能合并访存，但在compute_new_means归并时可以合并访存
         global[offset + blockIdx.x] = shared_data[threadIdx.x];
     }
+}
+
+template <typename T>
+__device__ void scan_in_block(const T* local, T* global) {
+    const int id = blockIdx.x * blockDim.x + threadIdx.x;
+    T val1 = local[id], val2;
+    for(int stride = 1; stride < 32; stride<<=1){
+        val2 = __shfl_up(val1, stride);
+        if (threadIdx.x % 32 >= stride)
+            val1 += val2;
+    }
+    global[id] = val1;    
 }
 
 __global__ void assign_clusters(const float* data_x, const float* data_y, int* label, int data_size,
@@ -118,22 +132,30 @@ __global__ void compute_new_means(float* new_means_x, float* new_means_y,
     if (cluster == 0)   *max_diff = diff;
 }
 
-// void init_clusters(const float* data_x, const float* data_y, float* distance, int number_of_elements,
-//                    float* d_mean_x, float* d_mean_y, int num_choices) {
-//     const int id = blockIdx.x * blockDim.x + threadIdx.x;
-//     const int width = blockDim.x * gridDim.x;
-//     for (int i = 0; i < p; i++) {
-//         int index = i * width + id;
-//         if (index >= data_size) return;
-
-//         float dd = FLT_MAX;
-//         for (int j = 0; j < i; j++) {   // 已选的中心
-//             float d = squared_l2_distance(h_x[k], h_y[k], d_mean_x[j], d_mean_y[j]);
-//             if (d < dd)     dd = d;
-//         }
-//         distance[index] = dd;
-//     }
-// }
+__global__ void init_clusters(const float* data_x, const float* data_y, float* prefix, int data_size,
+                              float* d_mean_x, float* d_mean_y, int k, int p) {
+    const int id = blockIdx.x * blockDim.x + threadIdx.x;
+    const int width = blockDim.x * gridDim.x;
+    
+    for (int num_choices = 1; num_choices < k; num_choices++) {
+        for (int i = 0; i < p; i++) {
+            int index = i * width + id;
+            if (index >= data_size) break;
+    
+            float dd = FLT_MAX;
+            for (int j = 0; j < num_choices; j++) {   // 已选的中心
+                float d = squared_l2_distance(data_x[index], data_y[index], d_mean_x[j], d_mean_y[j]);
+                if (d < dd)     dd = d;
+            }
+            prefix[index] = dd;
+        }
+        int max_i = argmax(prefix, data_size);
+        if (id == 0) {
+            d_mean_x[num_choices] = data_x[max_i];
+            d_mean_y[num_choices] = data_y[max_i];
+        }
+    }
+}
 
 int main(int argc, const char *argv[])
 {
@@ -166,12 +188,9 @@ int main(int argc, const char *argv[])
     srand(time(NULL));
     thrust::device_vector<float> d_mean_x(k);
     thrust::device_vector<float> d_mean_y(k);
-    for (int i = 0; i < k; i++) {
-        int index = rand() % number_of_elements;
-        d_mean_x[i] = h_x[index];
-        d_mean_y[i] = h_y[index];
-    }
-    // init_clusters(h_x, h_y, d_mean_x, d_mean_y, k);
+    int index = rand() % number_of_elements;
+    d_mean_x[0] = h_x[index];
+    d_mean_y[0] = h_y[index];
 
     const int threads = 1024;
     int blocks = (number_of_elements + threads - 1) / threads, p = 1;
@@ -181,10 +200,19 @@ int main(int argc, const char *argv[])
         p = (number_of_elements + 65535) / 65536;
     }
 
-    thrust::device_vector<float> d_sums_x(k * blocks);
-    thrust::device_vector<float> d_sums_y(k * blocks);
+    thrust::device_vector<float> d_sums_x(k * blocks), d_sums_y(k * blocks), distance(number_of_elements);
     thrust::device_vector<int> d_counts(k * blocks, 0), d_label(number_of_elements, 0);
 
+    init_clusters<<<blocks, threads>>>(
+        thrust::raw_pointer_cast(d_x.data()),
+        thrust::raw_pointer_cast(d_y.data()),
+        thrust::raw_pointer_cast(distance.data()),
+        number_of_elements, 
+        thrust::raw_pointer_cast(d_mean_x.data()),
+        thrust::raw_pointer_cast(d_mean_y.data()),
+        k, p
+    );
+    
     int number_of_iterations = 300;
     float tol = 1e-4f, s = tol + 1.0f, *d_s;
     cudaMalloc(&d_s, sizeof(float));
