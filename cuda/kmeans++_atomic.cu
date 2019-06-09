@@ -1,3 +1,9 @@
+/*
+ * @Description: 使用原子指令实现device级别的归约的kmeans++
+ * @Author: 劳马东
+ * @Date: 2019-06-07 18:36:45
+ * @LastEditTime: 2019-06-09 23:17:11
+ */
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 #include <thrust/functional.h>
@@ -10,6 +16,9 @@
 #include "common.cuh"
 #include "io.cuh"
 
+/**
+ * @description: 使用原子指令归约的核函数
+ */
 __global__ void assign_clusters(const float* data_x, const float* data_y, int* label, int data_size,
                                 const float* means_x, const float* means_y, 
                                 float* new_sums_x, float* new_sums_y, float* counts, int k)
@@ -32,13 +41,13 @@ __global__ void assign_clusters(const float* data_x, const float* data_y, int* l
         local_count[best_cluster]++;
     }
 
+    // 将线程的局部和归约到block，然后用原子指令增加到global memory
     deviceReduceBlockAtomic(local_sum_x, new_sums_x, k);
     deviceReduceBlockAtomic(local_sum_y, new_sums_y, k);
     deviceReduceBlockAtomic(local_count, counts, k);
 }
 
-// Each thread is one cluster, which just recomputes its coordinates as the mean
-// of all points assigned to it.
+// new_sum_*和counts（1*k）都归约好了，因此这里不用归约
 __global__ void compute_new_means(float* new_means_x, float* new_means_y,
                        float* new_sum_x, float* new_sum_y, float* counts, 
                        int blocks, float* max_diff)
@@ -136,6 +145,7 @@ int main(int argc, const char *argv[])
         );
         cudaDeviceSynchronize();
 
+        // 这里使用的是1*k的block，每个线程计算一个类
         compute_new_means<<<1, k>>>(
             thrust::raw_pointer_cast(d_mean_x.data()),
             thrust::raw_pointer_cast(d_mean_y.data()),

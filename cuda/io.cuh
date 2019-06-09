@@ -5,10 +5,14 @@
 #include <thrust/host_vector.h>
 #include <thrust/device_vector.h>
 
+/**
+ * @description: 输入聚类的各个坐标点
+ * @param
+    h_x: 存储坐标点一个维度的坐标
+ * @return: 
+ */
 int read_data(const char* file, thrust::host_vector<float>& h_x) {
     std::ifstream fx(file);
-
-    // Load x and y into host vectors ... (omitted)
     float x;
     int n, k;
     fx >> n >> k;
@@ -20,6 +24,13 @@ int read_data(const char* file, thrust::host_vector<float>& h_x) {
     return k;
 }
 
+/**
+ * @description: 输出每个点所属的类、每个类的中心点
+ * @param
+    d_label: 每个点所属的类
+    d_mean_*: 每个中心点一个维度的坐标值
+ * @return: 
+ */
 void output(const char* file, const thrust::device_vector<int>& d_label,
             const thrust::device_vector<float>& d_mean_x, const thrust::device_vector<float>& d_mean_y) {
     std::ofstream fout(file);
